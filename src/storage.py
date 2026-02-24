@@ -12,13 +12,13 @@ A股自选股智能分析系统 - 存储层
 """
 
 import atexit
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
 import re
 from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any, TYPE_CHECKING
-from pathlib import Path
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple
 
 import pandas as pd
 from sqlalchemy import (
@@ -26,9 +26,11 @@ from sqlalchemy import (
     Column,
     String,
     Float,
+    Boolean,
     Date,
     DateTime,
     Integer,
+    ForeignKey,
     Index,
     UniqueConstraint,
     Text,
@@ -239,6 +241,142 @@ class AnalysisHistory(Base):
         }
 
 
+class BacktestResult(Base):
+    """单条分析记录的回测结果。"""
+
+    __tablename__ = 'backtest_results'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    analysis_history_id = Column(
+        Integer,
+        ForeignKey('analysis_history.id'),
+        nullable=False,
+        index=True,
+    )
+
+    # 冗余字段，便于按股票筛选
+    code = Column(String(10), nullable=False, index=True)
+    analysis_date = Column(Date, index=True)
+
+    # 回测参数
+    eval_window_days = Column(Integer, nullable=False, default=10)
+    engine_version = Column(String(16), nullable=False, default='v1')
+
+    # 状态
+    eval_status = Column(String(16), nullable=False, default='pending')
+    evaluated_at = Column(DateTime, default=datetime.now, index=True)
+
+    # 建议快照（避免未来分析字段变化导致回测不可解释）
+    operation_advice = Column(String(20))
+    position_recommendation = Column(String(8))  # long/cash
+
+    # 价格与收益
+    start_price = Column(Float)
+    end_close = Column(Float)
+    max_high = Column(Float)
+    min_low = Column(Float)
+    stock_return_pct = Column(Float)
+
+    # 方向与结果
+    direction_expected = Column(String(16))  # up/down/flat/not_down
+    direction_correct = Column(Boolean, nullable=True)
+    outcome = Column(String(16))  # win/loss/neutral
+
+    # 目标价命中（仅 long 且配置了止盈/止损时有意义）
+    stop_loss = Column(Float)
+    take_profit = Column(Float)
+    hit_stop_loss = Column(Boolean)
+    hit_take_profit = Column(Boolean)
+    first_hit = Column(String(16))  # take_profit/stop_loss/ambiguous/neither/not_applicable
+    first_hit_date = Column(Date)
+    first_hit_trading_days = Column(Integer)
+
+    # 模拟执行（long-only）
+    simulated_entry_price = Column(Float)
+    simulated_exit_price = Column(Float)
+    simulated_exit_reason = Column(String(24))  # stop_loss/take_profit/window_end/cash/ambiguous_stop_loss
+    simulated_return_pct = Column(Float)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'analysis_history_id',
+            'eval_window_days',
+            'engine_version',
+            name='uix_backtest_analysis_window_version',
+        ),
+        Index('ix_backtest_code_date', 'code', 'analysis_date'),
+    )
+
+
+class BacktestSummary(Base):
+    """回测汇总指标（按股票或全局）。"""
+
+    __tablename__ = 'backtest_summaries'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    scope = Column(String(16), nullable=False, index=True)  # overall/stock
+    code = Column(String(16), index=True)
+
+    eval_window_days = Column(Integer, nullable=False, default=10)
+    engine_version = Column(String(16), nullable=False, default='v1')
+    computed_at = Column(DateTime, default=datetime.now, index=True)
+
+    # 计数
+    total_evaluations = Column(Integer, default=0)
+    completed_count = Column(Integer, default=0)
+    insufficient_count = Column(Integer, default=0)
+    long_count = Column(Integer, default=0)
+    cash_count = Column(Integer, default=0)
+
+    win_count = Column(Integer, default=0)
+    loss_count = Column(Integer, default=0)
+    neutral_count = Column(Integer, default=0)
+
+    # 准确率/胜率
+    direction_accuracy_pct = Column(Float)
+    win_rate_pct = Column(Float)
+    neutral_rate_pct = Column(Float)
+
+    # 收益
+    avg_stock_return_pct = Column(Float)
+    avg_simulated_return_pct = Column(Float)
+
+    # 目标价触发统计（仅 long 且配置止盈/止损时统计）
+    stop_loss_trigger_rate = Column(Float)
+    take_profit_trigger_rate = Column(Float)
+    ambiguous_rate = Column(Float)
+    avg_days_to_first_hit = Column(Float)
+
+    # 诊断字段（JSON 字符串）
+    advice_breakdown_json = Column(Text)
+    diagnostics_json = Column(Text)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'scope',
+            'code',
+            'eval_window_days',
+            'engine_version',
+            name='uix_backtest_summary_scope_code_window_version',
+        ),
+    )
+
+
+class ConversationMessage(Base):
+    """
+    Agent 对话历史记录表
+    """
+    __tablename__ = 'conversation_messages'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(100), index=True, nullable=False)
+    role = Column(String(20), nullable=False)  # user, assistant, system
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+
 class DatabaseManager:
     """
     数据库管理器 - 单例模式
@@ -250,6 +388,7 @@ class DatabaseManager:
     """
     
     _instance: Optional['DatabaseManager'] = None
+    _initialized: bool = False
     
     def __new__(cls, *args, **kwargs):
         """单例模式实现"""
@@ -265,7 +404,7 @@ class DatabaseManager:
         Args:
             db_url: 数据库连接 URL（可选，默认从配置读取）
         """
-        if self._initialized:
+        if getattr(self, '_initialized', False):
             return
         
         if db_url is None:
@@ -306,7 +445,9 @@ class DatabaseManager:
     def reset_instance(cls) -> None:
         """重置单例（用于测试）"""
         if cls._instance is not None:
-            cls._instance._engine.dispose()
+            if hasattr(cls._instance, '_engine') and cls._instance._engine is not None:
+                cls._instance._engine.dispose()
+            cls._instance._initialized = False
             cls._instance = None
 
     @classmethod
@@ -335,12 +476,30 @@ class DatabaseManager:
                 # 执行查询
                 session.commit()  # 如果需要
         """
+        if not getattr(self, '_initialized', False) or not hasattr(self, '_SessionLocal'):
+            raise RuntimeError(
+                "DatabaseManager 未正确初始化。"
+                "请确保通过 DatabaseManager.get_instance() 获取实例。"
+            )
         session = self._SessionLocal()
         try:
             return session
         except Exception:
             session.close()
             raise
+
+    @contextmanager
+    def session_scope(self):
+        """Provide a transactional scope around a series of operations."""
+        session = self.get_session()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
     
     def has_today_data(self, code: str, target_date: Optional[date] = None) -> bool:
         """
@@ -420,6 +579,8 @@ class DatabaseManager:
             return 0
 
         saved_count = 0
+        query_ctx = query_context or {}
+        current_query_id = (query_ctx.get("query_id") or "").strip()
 
         with self.get_session() as session:
             try:
@@ -456,14 +617,30 @@ class DatabaseManager:
                         existing.fetched_at = datetime.now()
 
                         if query_context:
-                            existing.query_id = query_context.get("query_id") or existing.query_id
-                            existing.query_source = query_context.get("query_source") or existing.query_source
-                            existing.requester_platform = query_context.get("requester_platform") or existing.requester_platform
-                            existing.requester_user_id = query_context.get("requester_user_id") or existing.requester_user_id
-                            existing.requester_user_name = query_context.get("requester_user_name") or existing.requester_user_name
-                            existing.requester_chat_id = query_context.get("requester_chat_id") or existing.requester_chat_id
-                            existing.requester_message_id = query_context.get("requester_message_id") or existing.requester_message_id
-                            existing.requester_query = query_context.get("requester_query") or existing.requester_query
+                            # Keep the first query_id to avoid overwriting historical links.
+                            if not existing.query_id and current_query_id:
+                                existing.query_id = current_query_id
+                            existing.query_source = (
+                                query_context.get("query_source") or existing.query_source
+                            )
+                            existing.requester_platform = (
+                                query_context.get("requester_platform") or existing.requester_platform
+                            )
+                            existing.requester_user_id = (
+                                query_context.get("requester_user_id") or existing.requester_user_id
+                            )
+                            existing.requester_user_name = (
+                                query_context.get("requester_user_name") or existing.requester_user_name
+                            )
+                            existing.requester_chat_id = (
+                                query_context.get("requester_chat_id") or existing.requester_chat_id
+                            )
+                            existing.requester_message_id = (
+                                query_context.get("requester_message_id") or existing.requester_message_id
+                            )
+                            existing.requester_query = (
+                                query_context.get("requester_query") or existing.requester_query
+                            )
                     else:
                         try:
                             with session.begin_nested():
@@ -479,14 +656,14 @@ class DatabaseManager:
                                     source=source,
                                     published_date=published_date,
                                     fetched_at=datetime.now(),
-                                    query_id=(query_context or {}).get("query_id"),
-                                    query_source=(query_context or {}).get("query_source"),
-                                    requester_platform=(query_context or {}).get("requester_platform"),
-                                    requester_user_id=(query_context or {}).get("requester_user_id"),
-                                    requester_user_name=(query_context or {}).get("requester_user_name"),
-                                    requester_chat_id=(query_context or {}).get("requester_chat_id"),
-                                    requester_message_id=(query_context or {}).get("requester_message_id"),
-                                    requester_query=(query_context or {}).get("requester_query"),
+                                    query_id=current_query_id or None,
+                                    query_source=query_ctx.get("query_source"),
+                                    requester_platform=query_ctx.get("requester_platform"),
+                                    requester_user_id=query_ctx.get("requester_user_id"),
+                                    requester_user_name=query_ctx.get("requester_user_name"),
+                                    requester_chat_id=query_ctx.get("requester_chat_id"),
+                                    requester_message_id=query_ctx.get("requester_message_id"),
+                                    requester_query=query_ctx.get("requester_query"),
                                 )
                                 session.add(record)
                                 session.flush()
@@ -521,6 +698,32 @@ class DatabaseManager:
                     )
                 )
                 .order_by(desc(NewsIntel.fetched_at))
+                .limit(limit)
+            ).scalars().all()
+
+            return list(results)
+
+    def get_news_intel_by_query_id(self, query_id: str, limit: int = 20) -> List[NewsIntel]:
+        """
+        根据 query_id 获取新闻情报列表
+
+        Args:
+            query_id: 分析记录唯一标识
+            limit: 返回数量限制
+
+        Returns:
+            NewsIntel 列表（按发布时间或抓取时间倒序）
+        """
+        from sqlalchemy import func
+
+        with self.get_session() as session:
+            results = session.execute(
+                select(NewsIntel)
+                .where(NewsIntel.query_id == query_id)
+                .order_by(
+                    desc(func.coalesce(NewsIntel.published_date, NewsIntel.fetched_at)),
+                    desc(NewsIntel.fetched_at)
+                )
                 .limit(limit)
             ).scalars().all()
 
@@ -584,16 +787,24 @@ class DatabaseManager:
         limit: int = 50
     ) -> List[AnalysisHistory]:
         """
-        查询分析历史记录
+        Query analysis history records.
+
+        Notes:
+        - If query_id is provided, perform exact lookup and ignore days window.
+        - If query_id is not provided, apply days-based time filtering.
         """
         cutoff_date = datetime.now() - timedelta(days=days)
 
         with self.get_session() as session:
-            conditions = [AnalysisHistory.created_at >= cutoff_date]
-            if code:
-                conditions.append(AnalysisHistory.code == code)
+            conditions = []
+
             if query_id:
                 conditions.append(AnalysisHistory.query_id == query_id)
+            else:
+                conditions.append(AnalysisHistory.created_at >= cutoff_date)
+
+            if code:
+                conditions.append(AnalysisHistory.code == code)
 
             results = session.execute(
                 select(AnalysisHistory)
@@ -603,6 +814,60 @@ class DatabaseManager:
             ).scalars().all()
 
             return list(results)
+    
+    def get_analysis_history_paginated(
+        self,
+        code: Optional[str] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        offset: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[AnalysisHistory], int]:
+        """
+        分页查询分析历史记录（带总数）
+        
+        Args:
+            code: 股票代码筛选
+            start_date: 开始日期（含）
+            end_date: 结束日期（含）
+            offset: 偏移量（跳过前 N 条）
+            limit: 每页数量
+            
+        Returns:
+            Tuple[List[AnalysisHistory], int]: (记录列表, 总数)
+        """
+        from sqlalchemy import func
+        
+        with self.get_session() as session:
+            conditions = []
+            
+            if code:
+                conditions.append(AnalysisHistory.code == code)
+            if start_date:
+                # created_at >= start_date 00:00:00
+                conditions.append(AnalysisHistory.created_at >= datetime.combine(start_date, datetime.min.time()))
+            if end_date:
+                # created_at < end_date+1 00:00:00 (即 <= end_date 23:59:59)
+                conditions.append(AnalysisHistory.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time()))
+            
+            # 构建 where 子句
+            where_clause = and_(*conditions) if conditions else True
+            
+            # 查询总数
+            total_query = select(func.count(AnalysisHistory.id)).where(where_clause)
+            total = session.execute(total_query).scalar() or 0
+            
+            # 查询分页数据
+            data_query = (
+                select(AnalysisHistory)
+                .where(where_clause)
+                .order_by(desc(AnalysisHistory.created_at))
+                .offset(offset)
+                .limit(limit)
+            )
+            results = session.execute(data_query).scalars().all()
+            
+            return list(results), total
     
     def get_data_range(
         self, 
@@ -883,13 +1148,37 @@ class DatabaseManager:
         if not text:
             return None
 
-        match = re.search(r"-?\d+(?:\.\d+)?", text)
-        if not match:
-            return None
+        # 尝试直接解析纯数字字符串
         try:
-            return float(match.group())
+            return float(text)
         except ValueError:
-            return None
+            pass
+
+        # 优先截取 "：" 到 "元" 之间的价格，避免误提取 MA5/MA10 等技术指标数字
+        colon_pos = max(text.rfind("："), text.rfind(":"))
+        yuan_pos = text.find("元", colon_pos + 1 if colon_pos != -1 else 0)
+        if yuan_pos != -1:
+            segment_start = colon_pos + 1 if colon_pos != -1 else 0
+            segment = text[segment_start:yuan_pos]
+            
+            # 使用 finditer 并过滤掉 MA 开头的数字
+            matches = list(re.finditer(r"-?\d+(?:\.\d+)?", segment))
+            valid_numbers = []
+            for m in matches:
+                # 检查前面是否是 "MA" (忽略大小写)
+                start_idx = m.start()
+                if start_idx >= 2:
+                    prefix = segment[start_idx-2:start_idx].upper()
+                    if prefix == "MA":
+                        continue
+                valid_numbers.append(m.group())
+            
+            if valid_numbers:
+                try:
+                    return float(valid_numbers[-1])
+                except ValueError:
+                    pass
+        return None
 
     def _extract_sniper_points(self, result: Any) -> Dict[str, Optional[float]]:
         """
@@ -920,6 +1209,31 @@ class DatabaseManager:
         raw_key = f"{code}|{title}|{source}|{date_str}"
         digest = hashlib.md5(raw_key.encode("utf-8")).hexdigest()
         return f"no-url:{code}:{digest}"
+
+    def save_conversation_message(self, session_id: str, role: str, content: str) -> None:
+        """
+        保存 Agent 对话消息
+        """
+        with self.session_scope() as session:
+            msg = ConversationMessage(
+                session_id=session_id,
+                role=role,
+                content=content
+            )
+            session.add(msg)
+
+    def get_conversation_history(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        获取 Agent 对话历史
+        """
+        with self.session_scope() as session:
+            stmt = select(ConversationMessage).filter(
+                ConversationMessage.session_id == session_id
+            ).order_by(ConversationMessage.created_at.desc()).limit(limit)
+            messages = session.execute(stmt).scalars().all()
+            
+            # 倒序返回，保证时间顺序
+            return [{"role": msg.role, "content": msg.content} for msg in reversed(messages)]
 
 
 # 便捷函数
