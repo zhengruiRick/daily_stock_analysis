@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { agentApi } from '../api/agent';
+import { generateUUID } from '../utils/uuid';
 import type { StrategyInfo } from '../api/agent';
 import { historyApi } from '../api/history';
 
@@ -64,7 +65,7 @@ const ChatPage: React.FC = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const initialFollowUpHandled = useRef(false);
   // Stable session ID for multi-turn conversation - persists for the page lifetime
-  const sessionIdRef = useRef(crypto.randomUUID());
+  const sessionIdRef = useRef(generateUUID());
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -87,14 +88,14 @@ const ChatPage: React.FC = () => {
     if (initialFollowUpHandled.current) return;
     const stock = searchParams.get('stock');
     const name = searchParams.get('name');
-    const queryId = searchParams.get('queryId');
+    const recordId = searchParams.get('recordId');
     if (stock) {
       initialFollowUpHandled.current = true;
       const displayName = name ? `${name}(${stock})` : stock;
       setInput(`请深入分析 ${displayName}`);
       // Load previous report context for data reuse
-      if (queryId) {
-        historyApi.getDetail(queryId).then((report) => {
+      if (recordId) {
+        historyApi.getDetail(Number(recordId)).then((report) => {
           const ctx: FollowUpContext = { stock_code: stock, stock_name: name };
           if (report.summary) ctx.previous_analysis_summary = report.summary;
           if (report.strategy) ctx.previous_strategy = report.strategy;
