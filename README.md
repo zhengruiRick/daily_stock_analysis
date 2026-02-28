@@ -44,7 +44,7 @@
 
 | 类型 | 支持 |
 |------|------|
-| AI 模型 | [AIHubMix](https://aihubmix.com/?aff=CfMq)、Gemini（免费）、OpenAI 兼容、DeepSeek、通义千问、Claude、Ollama |
+| AI 模型 | [AIHubMix](https://aihubmix.com/?aff=CfMq)、Gemini（免费）、OpenAI 兼容、DeepSeek、通义千问、Claude、Ollama、LiteLLM Proxy |
 | 行情数据 | AkShare、Tushare、Pytdx、Baostock、YFinance |
 | 新闻搜索 | Tavily、SerpAPI、Bocha、Brave |
 
@@ -138,6 +138,7 @@
 | `NEWS_MAX_AGE_DAYS` | 新闻最大时效（天），默认 3，避免使用过时信息 | 可选 |
 | `BIAS_THRESHOLD` | 乖离率阈值（%），默认 5.0，超过提示不追高；强势趋势股自动放宽 | 可选 |
 | `AGENT_MODE` | 开启 Agent 策略问股模式（`true`/`false`，默认 false） | 可选 |
+| `AGENT_SKILLS` | 激活的策略（逗号分隔），`all` 启用全部 11 个；不配置时默认 4 个，详见 `.env.example` | 可选 |
 | `AGENT_MAX_STEPS` | Agent 最大推理步数（默认 10） | 可选 |
 | `AGENT_STRATEGY_DIR` | 自定义策略目录（默认内置 `strategies/`） | 可选 |
 | `TRADING_DAY_CHECK_ENABLED` | 交易日检查（默认 `true`）：非交易日跳过执行；设为 `false` 或使用 `--force-run` 强制执行 | 可选 |
@@ -171,6 +172,7 @@ python main.py
 ```
 
 > Docker 部署、定时任务配置请参考 [完整指南](docs/full-guide.md)
+> 桌面客户端打包请参考 [桌面端打包说明](docs/desktop-package.md)
 
 ## 📱 推送效果
 
@@ -258,17 +260,17 @@ python main.py
 
 ### 启动方式
 
-1. **编译前端** (首次运行需要)
+1. **启动服务**（默认会自动编译前端）
+   ```bash
+   python main.py --webui       # 启动 Web 界面 + 执行定时分析
+   python main.py --webui-only  # 仅启动 Web 界面
+   ```
+   启动时会在 `apps/dsa-web` 自动执行 `npm install && npm run build`。
+   如需关闭自动构建，设置 `WEBUI_AUTO_BUILD=false`，并改为手动执行：
    ```bash
    cd ./apps/dsa-web
    npm install && npm run build
    cd ../..
-   ```
-
-2. **启动服务**
-   ```bash
-   python main.py --webui       # 启动 Web 界面 + 执行定时分析
-   python main.py --webui-only  # 仅启动 Web 界面
    ```
 
 访问 `http://127.0.0.1:8000` 即可使用。
